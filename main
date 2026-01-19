@@ -1,1 +1,139 @@
+# Data schema :
+user_id
+session_id
+event_name          -- page_view, product_view, add_to_cart, checkout, purchase
+event_timestamp
+channel             -- google, meta, organic, email
+device              -- mobile, desktop
+campaign_id
+
+# SQL – Funnel construction :
+-- funnel_stages.sql
+WITH ordered_events AS (
+    SELECT
+        user_id,
+        session_id,
+        event_name,
+        event_timestamp,
+        channel,
+        device,
+        campaign_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY user_id, session_id
+            ORDER BY event_timestamp
+        ) AS event_order
+    FROM events
+),
+
+stage_flags AS (
+    SELECT
+        user_id,
+        session_id,
+        channel,
+        device,
+        campaign_id,
+        MAX(CASE WHEN event_name = 'page_view' THEN 1 ELSE 0 END) AS page_view,
+        MAX(CASE WHEN event_name = 'product_view' THEN 1 ELSE 0 END) AS product_view,
+        MAX(CASE WHEN event_name = 'add_to_cart' THEN 1 ELSE 0 END) AS add_to_cart,
+        MAX(CASE WHEN event_name = 'checkout' THEN 1 ELSE 0 END) AS checkout,
+        MAX(CASE WHEN event_name = 'purchase' THEN 1 ELSE 0 END) AS purchase
+    FROM ordered_events
+    GROUP BY user_id, session_id, channel, device, campaign_id
+)
+
+SELECT * FROM stage_flags;
+
+ #Load funnel data :
+
 import pandas as pd
+import numpy as np
+df = pd.read_csv("funnel_stage_flags.csv")
+
+ #Funnel metrics :
+funnel_counts = {
+    "page_view": df["page_view"].sum(),
+    "product_view": df["product_view"].sum(),
+    "add_to_cart": df["add_to_cart"].sum(),
+    "checkout": df["checkout"].sum(),
+    "purchase": df["purchase"].sum()
+}
+
+funnel = pd.DataFrame.from_dict(
+    funnel_counts, orient="index", columns=["users"]
+)
+
+funnel["conversion_rate"] = funnel["users"] / funnel.iloc[0, 0]
+print(funnel)
+
+ #Target definition for Data Science :
+df["dropped_checkout"] = np.where(
+    (df["checkout"] == 1) & (df["purchase"] == 0), 1, 0
+)
+
+model_df = df[df["checkout"] == 1]
+
+ #Feature engineering
+features = [
+    "page_view",
+    "product_view",
+    "add_to_cart",
+    "channel",
+    "device"
+]
+
+X = model_df[features]
+y = model_df["dropped_checkout"]
+
+#Encoding + scaling :
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+num_features = ["page_view", "product_view", "add_to_cart"]
+cat_features = ["channel", "device"]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", StandardScaler(), num_features),
+        ("cat", OneHotEncoder(drop="first"), cat_features)
+    ]
+)
+#Logistic Regression :
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, classification_report
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, stratify=y, test_size=0.2, random_state=42
+)
+
+pipeline = Pipeline(steps=[
+    ("preprocess", preprocessor),
+    ("model", LogisticRegression(
+        max_iter=1000,
+        class_weight="balanced"
+    ))
+])
+#Odds ratios :
+feature_names = (
+    pipeline.named_steps["preprocess"]
+    .get_feature_names_out()
+)
+
+coefficients = pipeline.named_steps["model"].coef_[0]
+
+odds_ratios = pd.DataFrame({
+    "feature": feature_names,
+    "odds_ratio": np.exp(coefficients)
+}).sort_values(by="odds_ratio", ascending=False)
+
+print(odds_ratios)
+
+#Threshold optimization
+from sklearn.metrics import precision_recall_curve
+precision, recall, thresholds = precision_recall_curve(y_test, y_prob)
+
+optimal_threshold = thresholds[np.argmax(recall - 0.7 * precision)]
+print("Optimal threshold:", optimal_threshold)
+
+
